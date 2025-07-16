@@ -9,10 +9,16 @@ use ZipArchive;
 
 class WordToHtmlHelper
 {
+    // Время жизни кэша (в секундах)
     protected static int $cacheTtlSeconds = 86400; // 24 часа
 
     /**
-     * Конвертация DOCX или DOC в HTML с кэшированием и тегами инфоблока
+     * Основная функция: конвертирует DOCX или DOC в HTML,
+     * сохраняет результат в кэш, привязывает к инфоблоку через TaggedCache.
+     *
+     * @param string $filePath Полный путь к файлу .doc или .docx
+     * @param int $iblockId ID инфоблока для привязки кэша
+     * @return string|null HTML-представление файла или null при ошибке
      */
     public static function convertToHtmlWithIblockTag(string $filePath, int $iblockId): ?string
     {
@@ -54,10 +60,18 @@ class WordToHtmlHelper
         return null;
     }
 
+    /**
+     * Преобразует .doc файл в HTML через LibreOffice
+     * Требует установленного libreoffice с CLI-интерфейсом
+     *
+     * @param string $filePath Путь к .doc файлу
+     * @return string|null HTML содержимое или null
+     */
     protected static function convertDocToHtmlViaLibreOffice(string $filePath): ?string
     {
         $tempDir = sys_get_temp_dir() . '/' . uniqid('doc_', true);
         mkdir($tempDir, 0777, true);
+
         $cmd = sprintf(
             'libreoffice --headless --convert-to html --outdir %s %s 2>&1',
             escapeshellarg($tempDir),
@@ -75,6 +89,12 @@ class WordToHtmlHelper
         return null;
     }
 
+    /**
+     * Извлекает текст из .docx файла, разбирая его XML содержимое
+     *
+     * @param string $filePath Путь к .docx файлу
+     * @return string|null HTML или null при ошибке
+     */
     protected static function convertDocxToHtml(string $filePath): ?string
     {
         $zip = new ZipArchive();
@@ -84,6 +104,7 @@ class WordToHtmlHelper
         $rels = new SimpleXMLElement($zip->getFromName("word/_rels/document.xml.rels"));
         $mediaFiles = [];
 
+        // Извлечение встроенных изображений
         for ($i = 0; $i < $zip->numFiles; $i++) {
             $stat = $zip->statIndex($i);
             if (str_starts_with($stat['name'], 'word/media/')) {
@@ -95,6 +116,14 @@ class WordToHtmlHelper
         return self::parseBody($body->body, $rels, $mediaFiles);
     }
 
+    /**
+     * Разбор XML тела документа и конвертация в HTML
+     *
+     * @param SimpleXMLElement $body Основной XML-узел
+     * @param SimpleXMLElement $rels Отношения (включая изображения)
+     * @param array $mediaFiles Ассоциативный массив base64-картинок
+     * @return string HTML
+     */
     protected static function parseBody($body, $rels, $mediaFiles): string
     {
         $html = '';
@@ -104,6 +133,7 @@ class WordToHtmlHelper
         foreach ($body->children() as $node) {
             $name = $node->getName();
 
+            // Обработка списков
             if ($name === 'p' && isset($node->pPr->numPr)) {
                 $abstractId = (int) ($node->pPr->numPr->numId['val'] ?? 1);
                 $currentListType = ($abstractId % 2 === 0) ? 'ol' : 'ul';
@@ -118,6 +148,7 @@ class WordToHtmlHelper
                 continue;
             }
 
+            // Закрыть текущий список
             if (!empty($listBuffer)) {
                 $html .= "<$listType>" . implode('', $listBuffer) . "</$listType>";
                 $listBuffer = [];
@@ -143,6 +174,11 @@ class WordToHtmlHelper
         return $html;
     }
 
+    /**
+     * Конвертация параграфа в HTML, с поддержкой выравнивания и отступов
+     * @param SimpleXMLElement $node
+     * @return string HTML строки
+     */
     protected static function parseParagraph($node): string
     {
         $style = '';
@@ -166,6 +202,11 @@ class WordToHtmlHelper
         return '<li><p style="' . $style . '">' . $text . '</p></li>';
     }
 
+    /**
+     * Конвертация таблицы Word в HTML <table>
+     * @param SimpleXMLElement $node
+     * @return string HTML таблица
+     */
     protected static function parseTable($node): string
     {
         $html = '<table border="1">';
@@ -183,6 +224,13 @@ class WordToHtmlHelper
         return $html . '</table>';
     }
 
+    /**
+     * Обработка встроенных изображений через <img src="data:">
+     * @param SimpleXMLElement $node
+     * @param SimpleXMLElement $rels
+     * @param array $mediaFiles
+     * @return string
+     */
     protected static function parseStructuredDocumentTag($node, $rels, $mediaFiles): string
     {
         foreach ($node->xpath('.//a:blip') as $blip) {

@@ -1,74 +1,129 @@
 <?php
+namespace Local\Utils;
 
-namespace Local\Helpers;
+use Bitrix\Main\Data\Cache;
+use Bitrix\Main\Data\TaggedCache;
+use DOMDocument;
+use SimpleXMLElement;
+use ZipArchive;
 
 class WordToHtmlHelper
 {
-    public static function convertToHtml(string $filePath): ?string
+    protected static int $cacheTtlSeconds = 86400; // 24 часа
+
+    /**
+     * Конвертация DOCX или DOC в HTML с кэшированием и тегами инфоблока
+     */
+    public static function convertToHtmlWithIblockTag(string $filePath, int $iblockId): ?string
     {
         if (!is_file($filePath)) {
             return null;
         }
 
-        $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+        $cache = Cache::createInstance();
+        $cacheId = 'docx_html_' . md5($filePath . filemtime($filePath));
+        $cacheDir = '/local/word2html/';
+        $taggedCache = new TaggedCache();
 
-        if ($ext === 'docx') {
-            return self::convertDocxToHtml($filePath);
-        } elseif ($ext === 'doc') {
-            return self::convertDocToHtmlViaLibreOffice($filePath);
+        if ($cache->initCache(self::$cacheTtlSeconds, $cacheId, $cacheDir)) {
+            $vars = $cache->getVars();
+            return $vars['HTML'] ?? null;
+        } elseif ($cache->startDataCache()) {
+            $taggedCache->startTagCache($cacheDir);
+            $taggedCache->registerTag("iblock_id_{$iblockId}");
+
+            $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+            $html = null;
+
+            if ($ext === 'docx') {
+                $html = self::convertDocxToHtml($filePath);
+            } elseif ($ext === 'doc') {
+                $html = self::convertDocToHtmlViaLibreOffice($filePath);
+            }
+
+            if ($html) {
+                $taggedCache->endTagCache();
+                $cache->endDataCache(['HTML' => $html]);
+                return $html;
+            } else {
+                $taggedCache->abortTagCache();
+                $cache->abortDataCache();
+            }
         }
 
         return null;
     }
 
+    protected static function convertDocToHtmlViaLibreOffice(string $filePath): ?string
+    {
+        $tempDir = sys_get_temp_dir() . '/' . uniqid('doc_', true);
+        mkdir($tempDir, 0777, true);
+        $cmd = sprintf(
+            'libreoffice --headless --convert-to html --outdir %s %s 2>&1',
+            escapeshellarg($tempDir),
+            escapeshellarg($filePath)
+        );
+        exec($cmd);
+
+        $htmlFile = $tempDir . '/' . pathinfo($filePath, PATHINFO_FILENAME) . '.html';
+        if (is_file($htmlFile)) {
+            $html = file_get_contents($htmlFile);
+            array_map('unlink', glob("$tempDir/*"));
+            rmdir($tempDir);
+            return $html;
+        }
+        return null;
+    }
+
     protected static function convertDocxToHtml(string $filePath): ?string
     {
-        $zip = new \ZipArchive();
-        if ($zip->open($filePath) !== true) {
-            return null;
-        }
+        $zip = new ZipArchive();
+        if ($zip->open($filePath) !== true) return null;
 
-        $documentXml = $zip->getFromName('word/document.xml');
-        $relsXml = $zip->getFromName('word/_rels/document.xml.rels');
+        $body = new SimpleXMLElement($zip->getFromName("word/document.xml"));
+        $rels = new SimpleXMLElement($zip->getFromName("word/_rels/document.xml.rels"));
         $mediaFiles = [];
 
         for ($i = 0; $i < $zip->numFiles; $i++) {
-            $name = $zip->getNameIndex($i);
-            if (strpos($name, 'word/media/') === 0) {
-                $mediaFiles[$name] = base64_encode($zip->getFromName($name));
+            $stat = $zip->statIndex($i);
+            if (str_starts_with($stat['name'], 'word/media/')) {
+                $mediaFiles[$stat['name']] = base64_encode($zip->getFromIndex($i));
             }
         }
-
         $zip->close();
 
-        if (!$documentXml) {
-            return null;
-        }
-
-        $rels = [];
-        if ($relsXml) {
-            $relsXml = simplexml_load_string($relsXml);
-            foreach ($relsXml->Relationship as $rel) {
-                $rels[(string) $rel['Id']] = (string) $rel['Target'];
-            }
-        }
-
-        $documentXml = str_replace('w:', '', $documentXml);
-        $document = simplexml_load_string($documentXml);
-        if (!$document) {
-            return null;
-        }
-
-        $html = self::parseBody($document->body, $rels, $mediaFiles);
-
-        return "<div class=\"docx-content\">$html</div>";
+        return self::parseBody($body->body, $rels, $mediaFiles);
     }
 
     protected static function parseBody($body, $rels, $mediaFiles): string
     {
         $html = '';
+        $listBuffer = [];
+        $listType = 'ul';
+
         foreach ($body->children() as $node) {
-            switch ($node->getName()) {
+            $name = $node->getName();
+
+            if ($name === 'p' && isset($node->pPr->numPr)) {
+                $abstractId = (int) ($node->pPr->numPr->numId['val'] ?? 1);
+                $currentListType = ($abstractId % 2 === 0) ? 'ol' : 'ul';
+
+                if ($listType !== $currentListType && !empty($listBuffer)) {
+                    $html .= "<$listType>" . implode('', $listBuffer) . "</$listType>";
+                    $listBuffer = [];
+                }
+
+                $listType = $currentListType;
+                $listBuffer[] = self::parseParagraph($node);
+                continue;
+            }
+
+            if (!empty($listBuffer)) {
+                $html .= "<$listType>" . implode('', $listBuffer) . "</$listType>";
+                $listBuffer = [];
+            }
+
+            switch ($name) {
                 case 'p':
                     $html .= self::parseParagraph($node);
                     break;
@@ -80,111 +135,68 @@ class WordToHtmlHelper
                     break;
             }
         }
+
+        if (!empty($listBuffer)) {
+            $html .= "<$listType>" . implode('', $listBuffer) . "</$listType>";
+        }
+
         return $html;
     }
 
-    protected static function parseParagraph($p): string
+    protected static function parseParagraph($node): string
     {
-        $align = (string) $p->pPr->jc['val'] ?? 'left';
-        $indentLeft = (int) $p->pPr->ind['left'] ?? 0;
+        $style = '';
 
-        $style = "text-align:$align;";
-        if ($indentLeft > 0) {
-            $px = intval($indentLeft / 20); // приблизительно 1px ~ 20pt
-            $style .= "padding-left:{$px}px;";
+        if (isset($node->pPr->jc)) {
+            $align = (string)$node->pPr->jc['val'];
+            $style .= "text-align:$align;";
+        }
+        if (isset($node->pPr->ind)) {
+            $left = (int)$node->pPr->ind['left'];
+            $style .= "margin-left:" . round($left / 20) . "px;";
         }
 
-        $html = '';
-        foreach ($p->r as $run) {
-            $text = (string) $run->t;
-            if (trim($text) === '') continue;
-
-            $bold = isset($run->rPr->b);
-            $italic = isset($run->rPr->i);
-            $underline = isset($run->rPr->u);
-
-            $styles = [];
-            if ($bold) $styles[] = 'font-weight:bold';
-            if ($italic) $styles[] = 'font-style:italic';
-            if ($underline) $styles[] = 'text-decoration:underline';
-
-            $styleAttr = $styles ? ' style="' . implode(';', $styles) . '"' : '';
-            $html .= "<span$styleAttr>" . htmlspecialchars($text) . "</span>";
+        $text = '';
+        foreach ($node->r as $run) {
+            foreach ($run->t as $t) {
+                $text .= htmlspecialchars((string)$t);
+            }
         }
 
-        if (isset($p->pPr->numPr)) {
-            // List paragraph
-            return "<li style=\"$style\">$html</li>";
-        }
-
-        return "<p style=\"$style\">$html</p>";
+        return '<li><p style="' . $style . '">' . $text . '</p></li>';
     }
 
-    protected static function parseTable($tbl): string
+    protected static function parseTable($node): string
     {
-        $html = '<table border="1" cellspacing="0" cellpadding="4">';
-        foreach ($tbl->tr as $tr) {
+        $html = '<table border="1">';
+        foreach ($node->tr as $tr) {
             $html .= '<tr>';
             foreach ($tr->tc as $tc) {
-                $content = '';
+                $html .= '<td>';
                 foreach ($tc->p as $p) {
-                    $content .= self::parseParagraph($p);
+                    $html .= self::parseParagraph($p);
                 }
-                $html .= "<td>$content</td>";
+                $html .= '</td>';
             }
             $html .= '</tr>';
         }
-        $html .= '</table>';
-        return $html;
+        return $html . '</table>';
     }
 
-    protected static function parseStructuredDocumentTag($sdt, $rels, $mediaFiles): string
+    protected static function parseStructuredDocumentTag($node, $rels, $mediaFiles): string
     {
-        $html = '';
-        foreach ($sdt->xpath('.//drawing') as $drawing) {
-            $blip = $drawing->xpath('.//a:blip')[0] ?? null;
-            if ($blip && $blip->attributes('r', true)['embed']) {
-                $rid = (string) $blip->attributes('r', true)['embed'];
-                $target = $rels[$rid] ?? null;
-                if ($target && isset($mediaFiles["word/$target"])) {
-                    $ext = pathinfo($target, PATHINFO_EXTENSION);
-                    $base64 = $mediaFiles["word/$target"];
-                    $html .= "<img src=\"data:image/$ext;base64,$base64\" alt=\"image\" />";
+        foreach ($node->xpath('.//a:blip') as $blip) {
+            $rId = (string)$blip['r:embed'];
+            foreach ($rels->Relationship as $rel) {
+                if ((string)$rel['Id'] === $rId) {
+                    $target = 'word/' . (string)$rel['Target'];
+                    if (isset($mediaFiles[$target])) {
+                        $base64 = $mediaFiles[$target];
+                        return '<img src="data:image/png;base64,' . $base64 . '" />';
+                    }
                 }
             }
         }
-        return $html;
-    }
-
-    protected static function convertDocToHtmlViaLibreOffice(string $filePath): ?string
-    {
-        $outputDir = sys_get_temp_dir() . '/doc_' . uniqid();
-        if (!mkdir($outputDir, 0777, true)) {
-            return null;
-        }
-
-        $cmd = sprintf(
-            'libreoffice --headless --convert-to html --outdir %s %s',
-            escapeshellarg($outputDir),
-            escapeshellarg($filePath)
-        );
-
-        exec($cmd, $output, $code);
-        if ($code !== 0) {
-            return null;
-        }
-
-        $basename = pathinfo($filePath, PATHINFO_FILENAME) . '.html';
-        $htmlPath = $outputDir . '/' . $basename;
-
-        if (!file_exists($htmlPath)) {
-            return null;
-        }
-
-        $html = file_get_contents($htmlPath);
-        unlink($htmlPath);
-        rmdir($outputDir);
-
-        return $html ?: null;
+        return '';
     }
 }
